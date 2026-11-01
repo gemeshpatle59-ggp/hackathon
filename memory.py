@@ -1,85 +1,81 @@
 """
-Long-term patient memory.
-  add(pid, text, kind="fact")  -> store a memory
-  search(pid, query, n=5)      -> list of the most relevant memories (strings)
+LONG-TERM MEMORY. ChromaDB stores everything the patient has told us as searchable text, so the
+Patient Agent can recall relevant history ("last month you said the new tablet made you dizzy").
 
-Uses ChromaDB if it is installed and working; otherwise falls back automatically to a simple
-JSON file with keyword matching, so the project still runs (e.g. on Python 3.14 where chromadb may not install).
+If ChromaDB is not installed or does not work on your Python version (it can fail on very new Pythons),
+memory automatically falls back to a simple JSON file with keyword search. It still persists between runs.
 """
 import json
 import os
-import re
 import uuid
 from datetime import datetime
 
 import config
 
-_FALLBACK_FILE = "memory_fallback.json"
 _collection = None
 _chroma_failed = False
+_fallback = None          # list of [patient_id, text], loaded lazily from disk
+_FALLBACK_FILE = os.path.join(config.CHROMA_DIR, "fallback_memory.json")
 
 
 def _get_collection():
-    global _collection, _chroma_failed
-    if _chroma_failed:
-        return None
+    global _collection
     if _collection is None:
-        try:
-            import chromadb
-            client = chromadb.PersistentClient(path=config.CHROMA_DIR)
-            _collection = client.get_or_create_collection("patient_memory")
-        except Exception:
-            _chroma_failed = True
-            return None
+        import chromadb
+        client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+        kwargs = {}
+        if config.EMBED_MODEL:  # use a multilingual embedder (e.g. BAAI/bge-m3) for Hindi/Marathi recall
+            from chromadb.utils import embedding_functions
+            kwargs["embedding_function"] = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=config.EMBED_MODEL)
+        _collection = client.get_or_create_collection("patient_memory", **kwargs)
     return _collection
 
 
-# ---- fallback store ------------------------------------------------------------
-def _load() -> list:
-    if os.path.exists(_FALLBACK_FILE):
+def _mark_chroma_failed(err):
+    global _chroma_failed
+    if not _chroma_failed:
+        print(f"[memory] ChromaDB unavailable ({type(err).__name__}); using simple file-based memory instead.")
+    _chroma_failed = True
+
+
+def _load_fallback():
+    global _fallback
+    if _fallback is None:
         try:
             with open(_FALLBACK_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+                _fallback = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _fallback = []
+    return _fallback
 
 
-def _save(items: list):
+def _save_fallback():
+    os.makedirs(config.CHROMA_DIR, exist_ok=True)
     with open(_FALLBACK_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=1)
+        json.dump(_fallback, f, ensure_ascii=False)
 
 
-def _words(text: str) -> set:
-    return set(re.findall(r"\w+", text.lower()))
-
-
-# ---- public API ------------------------------------------------------------------
-def add(pid: str, text: str, kind: str = "fact"):
-    if not text or not text.strip():
-        return
-    col = _get_collection()
-    if col is not None:
+def add(pid: str, text: str, kind: str = "note"):
+    text = f"[{datetime.now():%Y-%m-%d}] {text}"
+    if not _chroma_failed:
         try:
-            col.add(documents=[text], metadatas=[{"patient_id": pid, "kind": kind}], ids=[str(uuid.uuid4())])
+            _get_collection().add(ids=[str(uuid.uuid4())], documents=[text], metadatas=[{"patient_id": pid, "kind": kind}])
             return
-        except Exception:
-            pass
-    items = _load()
-    items.append({"pid": pid, "kind": kind, "text": text, "ts": datetime.now().isoformat(timespec="seconds")})
-    _save(items)
+        except Exception as e:
+            _mark_chroma_failed(e)
+    _load_fallback().append([pid, text])
+    _save_fallback()
 
 
-def search(pid: str, query: str, n: int = 5) -> list:
-    col = _get_collection()
-    if col is not None:
+def search(pid: str, query: str, k: int = 4) -> list:
+    if not _chroma_failed:
         try:
-            res = col.query(query_texts=[query], n_results=n, where={"patient_id": pid})
-            return res["documents"][0] if res.get("documents") else []
-        except Exception:
-            pass
-    mine = [m for m in _load() if m["pid"] == pid]
-    q = _words(query)
-    scored = sorted(mine, key=lambda m: len(q & _words(m["text"])), reverse=True)
-    hits = [m["text"] for m in scored if q & _words(m["text"])][:n]
-    return hits or [m["text"] for m in mine[-3:]]          # nothing matched: most recent memories
+            res = _get_collection().query(query_texts=[query], n_results=k, where={"patient_id": pid})
+            return res["documents"][0] if res["documents"] else []
+        except Exception as e:
+            _mark_chroma_failed(e)
+    words = set(query.lower().split())
+    scored = [(len(words & set(t.lower().split())), t) for p, t in _load_fallback() if p == pid]
+    best = [t for s, t in sorted(scored, key=lambda x: x[0], reverse=True)[:k] if s > 0]
+    return best or [t for p, t in _load_fallback() if p == pid][-2:]   # no keyword hit -> most recent memories

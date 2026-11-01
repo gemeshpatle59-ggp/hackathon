@@ -4,7 +4,7 @@ Model wrapper used by every agent.
   ask_json(model, system, user, role=...)  -> dict (parsed JSON, {} if the model returned garbage)
 
 Talks to any OpenAI-compatible endpoint with plain `requests` (default: Hugging Face router).
-Set LLM_BASE_URL / LLM_API_KEY / FAST_MODEL / REASONING_MODEL to use Gemini, Groq, Ollama...
+Set LLM_BASE_URL / LLM_API_KEY / FAST_MODEL / REASONING_MODEL to use OpenAI, Anthropic, Gemini, Groq, Ollama...
 Optional: LLM_TIMEOUT (s, default 60), LLM_RETRIES (default 5), LLM_MIN_INTERVAL (s between calls).
 With MOCK_LLM=1 no network call is made and mock_llm.py supplies canned replies.
 """
@@ -19,6 +19,7 @@ import config
 
 
 _last_call = 0.0
+_QUIRKS = {}            # per-model parameter fixes learned at runtime (e.g. newer OpenAI models)
 
 
 def _clean(text: str) -> str:
@@ -35,6 +36,11 @@ def _chat(model: str, system: str, user: str) -> str:
     max_tokens = 4000 if "deepseek" in model.lower() else 3000     # reasoning models spend tokens thinking
     payload = {"model": model, "max_tokens": max_tokens, "temperature": 0.3,
                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    q = _QUIRKS.setdefault(model, {})
+    if q.get("completion_tokens"):
+        payload["max_completion_tokens"] = payload.pop("max_tokens") * 3     # reasoning models also "think" in this budget
+    if q.get("no_temp"):
+        payload.pop("temperature", None)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     timeout = int(os.getenv("LLM_TIMEOUT", "60"))
     attempts = int(os.getenv("LLM_RETRIES", "5"))
@@ -52,6 +58,16 @@ def _chat(model: str, system: str, user: str) -> str:
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"] or ""
             last_err = f"HTTP {r.status_code}: {r.text[:900]}"
+            if r.status_code == 400:                                   # model rejects a parameter: adapt once, remember
+                changed = False
+                if "max_completion_tokens" in r.text and "max_tokens" in payload:
+                    payload["max_completion_tokens"] = payload.pop("max_tokens") * 3
+                    q["completion_tokens"] = changed = True
+                if "temperature" in r.text and "temperature" in payload:
+                    payload.pop("temperature")
+                    q["no_temp"] = changed = True
+                if changed:
+                    continue
             if r.status_code == 429 and re.search(r"per.?day|daily", r.text, re.I):   # daily quota: retrying is pointless
                 raise RuntimeError(f"Daily free quota used up for model '{model}'. Wait until it resets, use another "
                                    f"model/provider, or run with MOCK_LLM=1. Details: {r.text[:400]}")
